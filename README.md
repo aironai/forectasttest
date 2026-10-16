@@ -69,6 +69,96 @@ This system achieves **Zero Overhead** by:
 
 ---
 
+## 🖼️ Visual Dashboard & Forecast Anatomy
+
+### 1. Live Grafana Dashboard
+The dashboard visualizes real-time metrics side-by-side with Timestral's forward projections, latency history, and zero-GPU telemetry:
+
+![Grafana Dashboard Preview](assets/grafana_dashboard_preview.png)
+
+### 2. Anatomy of the Forecast Cone
+How past telemetry transitions into probabilistic predictive bounds:
+
+![Forecast Interpretation Guide](assets/forecast_concept_diagram.png)
+
+---
+
+## 🧠 Beginner's Guide: How to Read & Interpret the Forecast
+
+### Why Does KV-Cache Saturation Matter?
+When serving frontier Large Language Models (like **Kimi K3** on 8x B300 GPUs), every active request requires storing token Key-Value pairs in GPU memory (the **KV-cache**). 
+
+- **At < 75% Capacity**: vLLM operates smoothly at peak generation throughput.
+- **At > 85% Capacity (Danger Zone)**: vLLM risks exhausting block allocations. When full, vLLM must **preempt** (pause and evict) running user requests, causing inter-token latency to spike from **20ms to 2000ms+** or dropping requests entirely with `503 Service Unavailable`.
+- **The Core Problem**: Conventional monitoring only alerts *after* the cache exceeds 85%, which is too late to spin up new replicas or reroute incoming queries.
+
+### What Do the 3 Forecast Bands Mean?
+
+| Visual Element | Metric Meaning | Intuitive Interpretation |
+| :--- | :--- | :--- |
+| **Solid Green Line** | **Actual KV-Cache** | What is happening right now and over the past 2 hours. |
+| **Dashed Blue Line** | **p50 (Median Forecast)** | The **"most expected path"**. If incoming traffic follows normal trends, this is where the system will be in 15–30 minutes. |
+| **Bottom Ribbon Edge** | **p10 (Optimistic Bound)** | The **"best-case floor"**. If active sessions finish fast and user traffic slows down, usage won't drop below this line. |
+| **Top Ribbon Edge** | **p90 / p95 (Pessimistic Upper Bound)** | The **"worst-case safety barrier"**. If user prompt bursts continue, long context documents arrive, or sessions linger, usage could reach this ceiling. |
+
+### The Power of "Early Warning Lead Time"
+Notice the shaded **Early Warning Window** in the diagram:
+- At **$T = 0$ (Now)**, actual KV-cache usage is only **34%** (everything looks green and safe to standard monitors).
+- However, Timestral projects the **p90 worst-case ceiling crossing 85% in 15 minutes**.
+- **Actionable Lead Time**: Platform engineers and automated autoscalers have a **15-minute window** to warm up a secondary B300 node or steer new long prompts via Envoy *before any request suffers degradation*.
+
+---
+
+## 🔬 Simulated Real-World Scenario: Anatomy of a Breach
+
+Here is a step-by-step example showing what happens during a real traffic surge:
+
+```
+Timeline (UTC)    Actual KV Cache    Timestral +15m Forecast (p50 / p90)     System Status & Automated Action
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+14:00:00          18.2% (Quiet)      p50: 21.0%  |  p90: 28.5%               🟢 HEALTHY (No Action Needed)
+14:05:00          24.5% (Steady)     p50: 27.2%  |  p90: 36.1%               🟢 HEALTHY
+14:10:00          38.0% (Burst)      p50: 55.4%  |  p90: 71.0%               🟢 HEALTHY (Observing upward drift)
+14:15:00          54.2% (Surge!)     p50: 74.0%  |  p90: 89.4% (BREACH!)     🔴 EARLY WARNING: BREACH IN 11 MIN
+                                                                             ↳ Envoy sheds low-priority batch traffic
+                                                                             ↳ Cluster autoscaler triggers node warmup
+14:20:00          68.1% (Stabilized) p50: 71.5%  |  p90: 82.0% (Defused)     🟢 HEALTHY (Traffic safely managed)
+```
+
+### JSON Inspection via API
+When the breach occurs, the daemon's `/api/forecast` REST endpoint immediately outputs structured telemetry for automated orchestrators:
+
+```json
+{
+  "model_name": "mistralai/Timestral-28M",
+  "inference_latency_ms": 35.9,
+  "cpu_threads": 8,
+  "device": "cpu",
+  "breach_warning": true,
+  "breach_lead_time_seconds": 660,
+  "breach_reason": "KV Cache p90 forecast exceeds 85% at +11m (89.4%)",
+  "summaries": [
+    {
+      "lead_time": "15m",
+      "kv_cache": {
+        "p10": 0.582,
+        "p50": 0.740,
+        "p90": 0.894,
+        "p95": 0.921
+      },
+      "requests_waiting": {
+        "p10": 0.0,
+        "p50": 2.1,
+        "p90": 9.4,
+        "p95": 14.2
+      }
+    }
+  ]
+}
+```
+
+---
+
 ## ⚡ Performance Benchmarks on Host CPU
 
 Measured on the 8x B300 HGX host machine running with `torch.set_num_threads(8)`:
