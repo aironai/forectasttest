@@ -1,0 +1,24 @@
+[Unit]
+Description=vLLM Timestral Zero-Overhead Time-Series Forecaster Daemon
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forectasttest
+Environment="PATH=/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="CPU_THREADS=8"
+Environment="FORECAST_INTERVAL=60"
+Environment="PORT=9100"
+
+# CPU Core Pinning: strictly isolate to host CPU cores 0-7
+ExecStart=/usr/bin/taskset -c 0-7 /home/ubuntu/.cargo/bin/uv run python -m src.service
+
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
