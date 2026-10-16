@@ -13,6 +13,25 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Standard summary lead times (label, seconds ahead). A lead time is only reported when it
+# fits inside the configured horizon.
+LEAD_TIMES: tuple[tuple[str, int], ...] = (("5m", 300), ("15m", 900), ("30m", 1800))
+
+# Model names reported when no real Timestral checkpoint produced the forecast
+SYNTHETIC_MODEL_NAMES = frozenset({"mock", "synthetic_fallback"})
+
+
+def format_lead_time(seconds: int) -> str:
+    """Formats a lead time without rounding sub-minute values down to zero.
+
+    Examples: 45 -> "45s", 600 -> "10m", 675 -> "11m15s".
+    """
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rem = divmod(seconds, 60)
+    return f"{minutes}m" if rem == 0 else f"{minutes}m{rem:02d}s"
+
 
 @dataclass
 class ForecastLeadTimeSummary:
@@ -63,6 +82,18 @@ class ForecastResult:
     breach_warning: bool = False
     breach_lead_time_seconds: int | None = None
     breach_reason: str = ""
+    # True when the context window was generated rather than read from Prometheus
+    synthetic_input: bool = False
+
+    @property
+    def synthetic_model(self) -> bool:
+        """True when the forecast came from the mock/fallback generator, not Timestral."""
+        return self.model_name in SYNTHETIC_MODEL_NAMES
+
+    @property
+    def is_synthetic(self) -> bool:
+        """True when either the input history or the model output is synthetic."""
+        return self.synthetic_input or self.synthetic_model
 
     def to_dict(self) -> dict[str, Any]:
         """Converts result to a JSON-serializable dictionary."""
@@ -76,6 +107,8 @@ class ForecastResult:
             "breach_warning": self.breach_warning,
             "breach_lead_time_seconds": self.breach_lead_time_seconds,
             "breach_reason": self.breach_reason,
+            "synthetic_input": self.synthetic_input,
+            "synthetic_model": self.synthetic_model,
             "summaries": [
                 {
                     "lead_time": s.lead_time_label,
@@ -184,7 +217,8 @@ class TimestralVLLMForecaster:
                 logger.warning("Failed loading candidate model '%s': %s", candidate, e)
 
         logger.error(
-            "Both '%s' and '%s' failed to load. Enabling synthetic forecaster fallback.",
+            "Both '%s' and '%s' failed to load. Enabling synthetic forecaster fallback; "
+            "forecasts are NOT model output and alert notifications will be suppressed.",
             self.requested_model_name,
             self.fallback_model_name,
         )
@@ -275,35 +309,30 @@ class TimestralVLLMForecaster:
         req_p90 = np.maximum(quantiles[1, :, p90_idx], 0.0)
         req_p95 = np.maximum(quantiles[1, :, p95_idx], 0.0)
 
-        # Standard lead time summaries
-        # 5m = 300s -> step 20 (index 19)
-        # 15m = 900s -> step 60 (index 59)
-        # 30m = 1800s -> step 120 (index 119)
-        lead_time_configs = [
-            ("5m", 300, min(19, H - 1)),
-            ("15m", 900, min(59, H - 1)),
-            ("30m", 1800, min(119, H - 1)),
-        ]
-
+        # Standard lead time summaries. Step k (1-based) lies k * step_seconds ahead, so the
+        # array index for a lead time is round(seconds / step_seconds) - 1. Lead times beyond
+        # the horizon are skipped instead of being filled with the last step's value.
         summaries: list[ForecastLeadTimeSummary] = []
-        for label, sec, idx in lead_time_configs:
-            if idx < H:
-                summaries.append(
-                    ForecastLeadTimeSummary(
-                        lead_time_label=label,
-                        lead_time_seconds=sec,
-                        step_index=idx,
-                        target_timestamp=float(future_timestamps[idx]),
-                        kv_cache_p10=float(kv_p10[idx]),
-                        kv_cache_p50=float(kv_p50[idx]),
-                        kv_cache_p90=float(kv_p90[idx]),
-                        kv_cache_p95=float(kv_p95[idx]),
-                        requests_waiting_p10=float(req_p10[idx]),
-                        requests_waiting_p50=float(req_p50[idx]),
-                        requests_waiting_p90=float(req_p90[idx]),
-                        requests_waiting_p95=float(req_p95[idx]),
-                    )
+        for label, sec in LEAD_TIMES:
+            idx = max(0, round(sec / self.step_seconds) - 1)
+            if idx >= H:
+                continue
+            summaries.append(
+                ForecastLeadTimeSummary(
+                    lead_time_label=label,
+                    lead_time_seconds=(idx + 1) * self.step_seconds,
+                    step_index=idx,
+                    target_timestamp=float(future_timestamps[idx]),
+                    kv_cache_p10=float(kv_p10[idx]),
+                    kv_cache_p50=float(kv_p50[idx]),
+                    kv_cache_p90=float(kv_p90[idx]),
+                    kv_cache_p95=float(kv_p95[idx]),
+                    requests_waiting_p10=float(req_p10[idx]),
+                    requests_waiting_p50=float(req_p50[idx]),
+                    requests_waiting_p90=float(req_p90[idx]),
+                    requests_waiting_p95=float(req_p95[idx]),
                 )
+            )
 
         # Check breach threshold on p90
         breach_warning = False
@@ -316,7 +345,7 @@ class TimestralVLLMForecaster:
                 breach_lead_time_sec = (step_i + 1) * self.step_seconds
                 breach_reason = (
                     f"KV Cache p90 forecast exceeds {self.cache_breach_threshold * 100:.0f}% "
-                    f"at +{breach_lead_time_sec // 60}m ({kv_p90[step_i] * 100:.1f}%)"
+                    f"at +{format_lead_time(breach_lead_time_sec)} ({kv_p90[step_i] * 100:.1f}%)"
                 )
                 break
             if req_p90[step_i] >= self.queue_breach_threshold:
@@ -324,7 +353,7 @@ class TimestralVLLMForecaster:
                 breach_lead_time_sec = (step_i + 1) * self.step_seconds
                 breach_reason = (
                     f"Queue depth p90 forecast exceeds {self.queue_breach_threshold:.0f} requests "
-                    f"at +{breach_lead_time_sec // 60}m ({req_p90[step_i]:.1f})"
+                    f"at +{format_lead_time(breach_lead_time_sec)} ({req_p90[step_i]:.1f})"
                 )
                 break
 

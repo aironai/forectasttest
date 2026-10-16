@@ -37,7 +37,14 @@ def test_metrics_exporter_updates_and_formatting() -> None:
 
 
 def test_fastapi_endpoints() -> None:
-    daemon = ForecastingDaemon(mock_mode=True, context_steps=64, horizon_steps=30)
+    daemon = ForecastingDaemon(
+        prometheus_url="http://mock-offline-prom:9999",
+        vllm_url="http://mock-offline-vllm:9999",
+        mock_mode=True,
+        synthetic_fallback=True,
+        context_steps=64,
+        horizon_steps=30,
+    )
     # Run one cycle to populate latest_result
     daemon.run_single_cycle()
 

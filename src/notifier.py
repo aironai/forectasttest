@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import smtplib
@@ -13,9 +14,22 @@ from typing import Any
 
 import requests
 
-from src.forecaster import ForecastResult
+from src.forecaster import ForecastResult, format_lead_time
 
 logger = logging.getLogger(__name__)
+
+ALERT_NEW_BREACH = "new_breach"
+ALERT_RECURRING_BREACH = "recurring_breach"
+ALERT_RECOVERY = "recovery"
+ALERT_COOLDOWN = "cooldown_active"
+ALERT_NONE = "none"
+
+BREACH_TITLE = "⚠️ Early Warning: vLLM Capacity Breach Projected"
+RECOVERY_TITLE = "✅ vLLM Metrics Stabilized"
+
+FONT_STACK = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+LABEL_CELL = "padding: 8px 0; color: #586069;"
+VALUE_CELL = "padding: 8px 0; font-family: monospace; font-size: 14px;"
 
 
 @dataclass
@@ -51,9 +65,26 @@ class AlertConfig:
             ),
         )
 
+    @property
+    def slack_enabled(self) -> bool:
+        return bool(self.slack_webhook_url)
+
+    @property
+    def email_enabled(self) -> bool:
+        return bool(self.smtp_host and self.email_to)
+
 
 class EarlyWarningNotifier:
-    """Manages threshold-based predictive warning alerts with deduplication and cooldown."""
+    """Manages threshold-based predictive warning alerts with deduplication and cooldown.
+
+    State machine:
+        safe   --breach-->  breach   sends "new_breach"
+        breach --breach-->  breach   sends "recurring_breach" once the cooldown has elapsed
+        breach --clear--->  safe     sends "recovery"
+
+    State only advances when at least one channel delivered the message, so a failed
+    delivery is retried on the next forecast cycle.
+    """
 
     def __init__(self, config: AlertConfig | None = None) -> None:
         self.config = config or AlertConfig.from_env()
@@ -62,32 +93,30 @@ class EarlyWarningNotifier:
 
     def is_configured(self) -> bool:
         """Returns True if at least one notification channel is active."""
-        has_slack = bool(self.config.slack_webhook_url)
-        has_email = bool(self.config.smtp_host and self.config.email_to)
-        return has_slack or has_email
+        return self.config.slack_enabled or self.config.email_enabled
 
     def should_trigger_alert(self, breach_active: bool) -> tuple[bool, str]:
         """Determines if a notification should be dispatched based on state and cooldown.
 
         Returns:
             (should_send, alert_type) where alert_type is 'new_breach', 'recurring_breach',
-            'recovery', or 'none'.
+            'recovery', 'cooldown_active', or 'none'.
         """
         now = time.time()
 
         if breach_active:
             if not self.in_breach_state:
-                # Transition: Safe -> Breach
-                return True, "new_breach"
-            elif (now - self.last_alert_timestamp) >= self.config.cooldown_seconds:
-                # Re-alert after cooldown expires
-                return True, "recurring_breach"
-            return False, "cooldown_active"
-        else:
-            if self.in_breach_state:
-                # Transition: Breach -> Safe (Recovery)
-                return True, "recovery"
-            return False, "none"
+                return True, ALERT_NEW_BREACH
+            if (now - self.last_alert_timestamp) >= self.config.cooldown_seconds:
+                return True, ALERT_RECURRING_BREACH
+            return False, ALERT_COOLDOWN
+        if self.in_breach_state:
+            return True, ALERT_RECOVERY
+        return False, ALERT_NONE
+
+    @staticmethod
+    def _lead_str(lead_time_seconds: int | None) -> str:
+        return f"+{format_lead_time(lead_time_seconds)}" if lead_time_seconds else "Imminent"
 
     def send_slack(
         self,
@@ -99,35 +128,35 @@ class EarlyWarningNotifier:
         is_recovery: bool = False,
     ) -> bool:
         """Sends a rich formatted Slack message using Block Kit."""
-        if not self.config.slack_webhook_url:
+        if not self.config.slack_enabled:
             return False
 
         color = "#36a64f" if is_recovery else "#e01e5a"
-        lead_str = f"+{lead_time_seconds // 60} minutes" if lead_time_seconds else "Imminent"
+        lead_str = self._lead_str(lead_time_seconds)
 
         fields = []
         if not is_recovery:
             if kv_p90 is not None:
                 fields.append(
-                    {"type": "mrkdwn", "text": f"*Projected KV-Cache (p90):*\n`{kv_p90*100:.1f}%`"}
+                    {"type": "mrkdwn", "text": f"*Peak KV-Cache p90:*\n`{kv_p90 * 100:.1f}%`"}
                 )
             if queue_p90 is not None:
                 fields.append(
-                    {"type": "mrkdwn", "text": f"*Projected Queue (p90):*\n`{queue_p90:.1f} reqs`"}
+                    {"type": "mrkdwn", "text": f"*Peak Queue p90:*\n`{queue_p90:.1f} reqs`"}
                 )
             fields.append({"type": "mrkdwn", "text": f"*Estimated Lead Time:*\n`{lead_str}`"})
             fields.append({"type": "mrkdwn", "text": "*Inference Device:*\n`Host CPU (0 MB VRAM)`"})
 
+        action_text = (
+            "Check the Grafana predictive fan to evaluate workload steering or cluster scaling "
+            "before requests are throttled."
+        )
         blocks: list[dict[str, Any]] = [
             {
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": (
-                        "✅ vLLM Metrics Stabilized"
-                        if is_recovery
-                        else "⚠️ Early Warning: vLLM Capacity Breach Projected"
-                    ),
+                    "text": RECOVERY_TITLE if is_recovery else BREACH_TITLE,
                     "emoji": True,
                 },
             },
@@ -135,11 +164,7 @@ class EarlyWarningNotifier:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        f"*{headline}*\n\n{reason}\n\n"
-                        f"👉 *Action Required*: Check the Grafana predictive fan to evaluate "
-                        f"workload steering or cluster scaling before requests are throttled."
-                    ),
+                    "text": f"*{headline}*\n\n{reason}\n\n👉 *Action Required*: {action_text}",
                 },
             },
         ]
@@ -147,19 +172,15 @@ class EarlyWarningNotifier:
         if fields:
             blocks.append({"type": "section", "fields": fields})
 
-        blocks.append(
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "📊 View Grafana Dashboard"},
-                        "url": self.config.grafana_url,
-                        "style": "primary" if not is_recovery else "default",
-                    }
-                ],
-            }
-        )
+        button: dict[str, Any] = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "📊 View Grafana Dashboard"},
+            "url": self.config.grafana_url,
+        }
+        # Slack only accepts "primary" or "danger"; omit the field for the default style
+        if not is_recovery:
+            button["style"] = "primary"
+        blocks.append({"type": "actions", "elements": [button]})
 
         payload = {"attachments": [{"color": color, "blocks": blocks}]}
 
@@ -168,11 +189,69 @@ class EarlyWarningNotifier:
             if resp.status_code == 200:
                 logger.info("Slack alert successfully dispatched to webhook")
                 return True
-            else:
-                logger.warning("Slack webhook returned status %d: %s", resp.status_code, resp.text)
+            logger.warning("Slack webhook returned status %d: %s", resp.status_code, resp.text)
         except Exception as e:
             logger.error("Error sending Slack alert: %s", e)
         return False
+
+    def _render_email_html(
+        self,
+        reason: str,
+        lead_str: str,
+        kv_p90: float | None,
+        queue_p90: float | None,
+        is_recovery: bool,
+    ) -> str:
+        """Renders the HTML email body. All dynamic values are HTML-escaped."""
+        status_color = "#28a745" if is_recovery else "#dc3545"
+        title = f"{RECOVERY_TITLE} (Recovery)" if is_recovery else BREACH_TITLE
+        kv_str = f"{kv_p90 * 100:.1f}%" if kv_p90 is not None else "N/A"
+        queue_str = f"{queue_p90:.1f} reqs" if queue_p90 is not None else "N/A"
+        rows = [
+            ("Estimated Lead Time", lead_str),
+            ("Peak KV-Cache p90", kv_str),
+            ("Peak Queue Depth p90", queue_str),
+            ("Inference Overhead", "0 MB GPU VRAM (Host CPU Pinned)"),
+        ]
+        table_rows = "".join(
+            f'<tr><td style="{LABEL_CELL}"><strong>{html.escape(label)}:</strong></td>'
+            f'<td style="{VALUE_CELL}">{html.escape(value)}</td></tr>'
+            for label, value in rows
+        )
+        grafana_url = html.escape(self.config.grafana_url, quote=True)
+
+        return f"""
+        <html>
+        <body style="font-family: {FONT_STACK}; line-height: 1.6; color: #333;
+                     max-width: 650px; margin: 0 auto; padding: 20px;">
+            <div style="background-color: {status_color}; color: #ffffff; padding: 15px 20px;
+                        border-radius: 6px 6px 0 0;">
+                <h2 style="margin: 0; font-size: 20px;">{html.escape(title)}</h2>
+            </div>
+            <div style="border: 1px solid #e1e4e8; border-top: none; padding: 25px;
+                        border-radius: 0 0 6px 6px; background-color: #fafbfc;">
+                <p style="font-size: 16px; margin-top: 0;">
+                    <strong>System Alert:</strong> {html.escape(reason)}
+                </p>
+                <div style="background-color: #ffffff; border: 1px solid #e1e4e8;
+                            border-radius: 6px; padding: 15px; margin: 20px 0;">
+                    <table style="width: 100%; border-collapse: collapse;">{table_rows}</table>
+                </div>
+                <div style="text-align: center; margin: 30px 0;">
+                    <a href="{grafana_url}" style="background-color: #0366d6; color: #ffffff;
+                       padding: 12px 24px; text-decoration: none; border-radius: 6px;
+                       font-weight: 600; display: inline-block;">
+                        Open Grafana Predictive Dashboard
+                    </a>
+                </div>
+                <p style="font-size: 12px; color: #6a737d; margin-bottom: 0;">
+                    This automated alert was generated by Mistral Timestral time-series
+                    forecasting on the 8x B300 HGX system.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
 
     def send_email(
         self,
@@ -184,54 +263,11 @@ class EarlyWarningNotifier:
         is_recovery: bool = False,
     ) -> bool:
         """Sends a notification email via SMTP."""
-        if not (self.config.smtp_host and self.config.email_to):
+        if not self.config.email_enabled:
             return False
 
-        lead_str = f"+{lead_time_seconds // 60}m" if lead_time_seconds else "Imminent"
-        status_color = "#28a745" if is_recovery else "#dc3545"
-
-        html_content = f"""
-        <html>
-        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 650px; margin: 0 auto; padding: 20px;">
-            <div style="background-color: {status_color}; color: #ffffff; padding: 15px 20px; border-radius: 6px 6px 0 0;">
-                <h2 style="margin: 0; font-size: 20px;">
-                    {'✅ vLLM Metrics Stabilized (Recovery)' if is_recovery else '⚠️ Early Warning: vLLM Capacity Breach Projected'}
-                </h2>
-            </div>
-            <div style="border: 1px solid #e1e4e8; border-top: none; padding: 25px; border-radius: 0 0 6px 6px; background-color: #fafbfc;">
-                <p style="font-size: 16px; margin-top: 0;"><strong>System Alert:</strong> {reason}</p>
-                <div style="background-color: #ffffff; border: 1px solid #e1e4e8; border-radius: 6px; padding: 15px; margin: 20px 0;">
-                    <table style="width: 100%; border-collapse: collapse;">
-                        <tr>
-                            <td style="padding: 8px 0; color: #586069;"><strong>Estimated Lead Time:</strong></td>
-                            <td style="padding: 8px 0; font-family: monospace; font-size: 14px;">{lead_str}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; color: #586069;"><strong>Projected KV-Cache (p90):</strong></td>
-                            <td style="padding: 8px 0; font-family: monospace; font-size: 14px;">{f'{kv_p90*100:.1f}%' if kv_p90 is not None else 'N/A'}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; color: #586069;"><strong>Projected Queue Depth (p90):</strong></td>
-                            <td style="padding: 8px 0; font-family: monospace; font-size: 14px;">{f'{queue_p90:.1f} reqs' if queue_p90 is not None else 'N/A'}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 8px 0; color: #586069;"><strong>Inference Overhead:</strong></td>
-                            <td style="padding: 8px 0; font-family: monospace; font-size: 14px;">0 MB GPU VRAM (Host CPU Pinned)</td>
-                        </tr>
-                    </table>
-                </div>
-                <div style="text-align: center; margin: 30px 0;">
-                    <a href="{self.config.grafana_url}" style="background-color: #0366d6; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600; display: inline-block;">
-                        Open Grafana Predictive Dashboard
-                    </a>
-                </div>
-                <p style="font-size: 12px; color: #6a737d; margin-bottom: 0;">
-                    This automated alert was generated by Mistral Timestral time-series forecasting on the 8x B300 HGX system.
-                </p>
-            </div>
-        </body>
-        </html>
-        """
+        lead_str = self._lead_str(lead_time_seconds)
+        html_content = self._render_email_html(reason, lead_str, kv_p90, queue_p90, is_recovery)
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -262,78 +298,68 @@ class EarlyWarningNotifier:
         return False
 
     def notify_forecast(self, result: ForecastResult) -> dict[str, Any]:
-        """Evaluates forecast result and dispatches notifications if state changes."""
+        """Evaluates a forecast result and dispatches notifications on state changes.
+
+        Returns a status dict with ``alert_type``, ``dispatched`` and per-channel results
+        (``slack_sent``/``email_sent`` are None when that channel is not configured).
+        """
         should_send, alert_type = self.should_trigger_alert(result.breach_warning)
-        status = {
+        status: dict[str, Any] = {
             "evaluated": True,
             "breach_warning": result.breach_warning,
             "alert_type": alert_type,
             "dispatched": False,
-            "slack_sent": False,
-            "email_sent": False,
+            "slack_sent": None,
+            "email_sent": None,
         }
 
         if not should_send:
             return status
 
-        # Extract 15m summary quantiles if available
-        s15 = next((s for s in result.summaries if s.lead_time_label == "15m"), None)
-        kv_p90 = s15.kv_cache_p90 if s15 else float(result.kv_cache_p90[-1])
-        queue_p90 = s15.requests_waiting_p90 if s15 else float(result.requests_waiting_p90[-1])
+        # Report the worst projected p90 across the whole horizon, which is what triggered
+        # (or cleared) the breach, rather than a fixed lead time that may not contain it
+        kv_p90 = float(result.kv_cache_p90.max())
+        queue_p90 = float(result.requests_waiting_p90.max())
+        horizon_str = format_lead_time(result.prediction_length * result.step_seconds)
+        is_recovery = alert_type == ALERT_RECOVERY
 
-        if alert_type in ("new_breach", "recurring_breach"):
+        if is_recovery:
+            headline = "✅ vLLM Metrics Stabilized Within Normal Operating Bounds"
+            reason = (
+                "Timestral forecast projects all metrics safely below threshold for the next "
+                f"{horizon_str}."
+            )
+            subject = "✅ [Resolved] vLLM KV-Cache & Queue Normal"
+            lead_time = None
+        else:
             headline = "⚠️ Projected vLLM KV-Cache / Queue Depth Capacity Exhaustion"
             reason = result.breach_reason or "Projected load exceeds configured safety threshold."
             subject = f"⚠️ [Alert] vLLM Capacity Breach Projected ({reason})"
+            lead_time = result.breach_lead_time_seconds
 
-            slack_ok = self.send_slack(
-                headline=headline,
-                reason=reason,
-                lead_time_seconds=result.breach_lead_time_seconds,
-                kv_p90=kv_p90,
-                queue_p90=queue_p90,
-                is_recovery=False,
+        common = {
+            "reason": reason,
+            "lead_time_seconds": lead_time,
+            "kv_p90": kv_p90,
+            "queue_p90": queue_p90,
+            "is_recovery": is_recovery,
+        }
+        if self.config.slack_enabled:
+            status["slack_sent"] = self.send_slack(headline=headline, **common)
+        if self.config.email_enabled:
+            status["email_sent"] = self.send_email(subject=subject, **common)
+
+        dispatched = bool(status["slack_sent"]) or bool(status["email_sent"])
+        status["dispatched"] = dispatched
+
+        if dispatched:
+            self.in_breach_state = not is_recovery
+            if not is_recovery:
+                self.last_alert_timestamp = time.time()
+        else:
+            logger.warning(
+                "No notification channel delivered the '%s' alert; retrying next cycle",
+                alert_type,
             )
-            email_ok = self.send_email(
-                subject=subject,
-                reason=reason,
-                lead_time_seconds=result.breach_lead_time_seconds,
-                kv_p90=kv_p90,
-                queue_p90=queue_p90,
-                is_recovery=False,
-            )
-
-            self.in_breach_state = True
-            self.last_alert_timestamp = time.time()
-            status["dispatched"] = slack_ok or email_ok
-            status["slack_sent"] = slack_ok
-            status["email_sent"] = email_ok
-
-        elif alert_type == "recovery":
-            headline = "✅ vLLM Metrics Stabilized Within Normal Operating Bounds"
-            reason = "Timestral forecast projects all metrics safely below threshold for next 30 minutes."
-            subject = "✅ [Resolved] vLLM KV-Cache & Queue Normal"
-
-            slack_ok = self.send_slack(
-                headline=headline,
-                reason=reason,
-                lead_time_seconds=None,
-                kv_p90=kv_p90,
-                queue_p90=queue_p90,
-                is_recovery=True,
-            )
-            email_ok = self.send_email(
-                subject=subject,
-                reason=reason,
-                lead_time_seconds=None,
-                kv_p90=kv_p90,
-                queue_p90=queue_p90,
-                is_recovery=True,
-            )
-
-            self.in_breach_state = False
-            status["dispatched"] = slack_ok or email_ok
-            status["slack_sent"] = slack_ok
-            status["email_sent"] = email_ok
 
         return status

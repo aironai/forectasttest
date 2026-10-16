@@ -12,6 +12,9 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="CPU_THREADS=8"
 Environment="FORECAST_INTERVAL=60"
 Environment="PORT=9100"
+# Alerting secrets and overrides (SLACK_WEBHOOK_URL, SMTP_*, thresholds, ...).
+# The leading "-" makes the file optional. See README "Early Warning Notifications".
+EnvironmentFile=-/etc/default/vllm-timestral-forecast
 
 # CPU Core Pinning: strictly isolate to host CPU cores 0-7
 ExecStart=/usr/bin/taskset -c 0-7 /home/ubuntu/.cargo/bin/uv run python -m src.service

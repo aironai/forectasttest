@@ -13,6 +13,17 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+DATA_SOURCE_PROMETHEUS = "prometheus"
+DATA_SOURCE_SYNTHETIC = "synthetic"
+
+# Metric names exposed by current and older vLLM releases
+KV_CACHE_METRIC_NAMES = (
+    "vllm:kv_cache_usage_perc",
+    "vllm:gpu_cache_usage_perc",
+    "vllm:gpu_cache_usage_factor",
+)
+REQUESTS_WAITING_METRIC_NAME = "vllm:num_requests_waiting"
+
 
 @dataclass
 class ObservationWindow:
@@ -26,6 +37,16 @@ class ObservationWindow:
     interval_seconds: int = 15
     context_steps: int = 512
     horizon_steps: int = 120
+    # "prometheus" when the context is real history, "synthetic" when it was generated
+    data_source: str = DATA_SOURCE_PROMETHEUS
+
+    @property
+    def is_synthetic(self) -> bool:
+        return self.data_source == DATA_SOURCE_SYNTHETIC
+
+
+class InsufficientHistoryError(RuntimeError):
+    """Raised when Prometheus lacks enough history and synthetic fallback is disabled."""
 
 
 class MetricsCollector:
@@ -38,7 +59,7 @@ class MetricsCollector:
         context_steps: int = 512,
         horizon_steps: int = 120,
         step_seconds: int = 15,
-        synthetic_fallback: bool = True,
+        synthetic_fallback: bool = False,
     ) -> None:
         self.prometheus_url = prometheus_url.rstrip("/")
         self.vllm_url = vllm_url.rstrip("/")
@@ -107,39 +128,60 @@ class MetricsCollector:
             logger.warning("Prometheus range query '%s' failed: %s", query, e)
         return []
 
+    @staticmethod
+    def _parse_exposition_line(line: str) -> tuple[str, float] | None:
+        """Parses one Prometheus text-format sample line into (metric_name, value)."""
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        name_end = len(line)
+        for sep in ("{", " "):
+            idx = line.find(sep)
+            if idx != -1:
+                name_end = min(name_end, idx)
+        name = line[:name_end]
+        # The value follows the closing label brace (or the name); an optional timestamp may follow
+        rest = line[line.rfind("}") + 1 :] if "}" in line else line[name_end:]
+        fields = rest.split()
+        if not fields:
+            return None
+        try:
+            return name, float(fields[0])
+        except ValueError:
+            return None
+
     def sample_direct_vllm_metrics(self) -> tuple[float, float] | None:
-        """Directly parses /metrics endpoint of vLLM if Prometheus is not available."""
+        """Directly parses the vLLM /metrics endpoint if Prometheus has no recent data.
+
+        Only exact metric-name matches are used. When several series exist (one per engine
+        or model), the maximum is taken, matching the max() aggregation used for Prometheus.
+        """
         endpoint = f"{self.vllm_url}/metrics"
         try:
             resp = requests.get(endpoint, timeout=3)
-            if resp.status_code == 200:
-                kv_cache = 0.0
-                waiting = 0.0
-                found_cache = False
-                for line in resp.text.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    # Match kv cache usage metrics
-                    if (
-                        line.startswith("vllm:kv_cache_usage_perc ")
-                        or line.startswith("vllm:gpu_cache_usage_factor ")
-                        or "kv_cache_usage_perc" in line
-                        or "gpu_cache_usage_factor" in line
-                    ):
-                        parts = line.split()
-                        kv_cache = float(parts[-1])
-                        found_cache = True
-                    elif (
-                        line.startswith("vllm:num_requests_waiting ")
-                        or "num_requests_waiting" in line
-                    ):
-                        parts = line.split()
-                        waiting = float(parts[-1])
-                if found_cache:
-                    return kv_cache, waiting
+            if resp.status_code != 200:
+                return None
         except Exception as e:
             logger.debug("Direct vLLM scrape failed: %s", e)
+            return None
+
+        kv_values: dict[str, list[float]] = {name: [] for name in KV_CACHE_METRIC_NAMES}
+        waiting_values: list[float] = []
+        for line in resp.text.splitlines():
+            parsed = self._parse_exposition_line(line)
+            if parsed is None:
+                continue
+            name, value = parsed
+            if name in kv_values:
+                kv_values[name].append(value)
+            elif name == REQUESTS_WAITING_METRIC_NAME:
+                waiting_values.append(value)
+
+        # Prefer the newest metric name that is present
+        for name in KV_CACHE_METRIC_NAMES:
+            if kv_values[name]:
+                waiting = max(waiting_values) if waiting_values else 0.0
+                return max(kv_values[name]), waiting
         return None
 
     def generate_synthetic_context(
@@ -205,7 +247,12 @@ class MetricsCollector:
         return np.nan_to_num(aligned, nan=0.0).astype(np.float32)
 
     def collect(self) -> ObservationWindow:
-        """Collects the observation window from Prometheus, direct vLLM, or synthetic fallback."""
+        """Collects the observation window from Prometheus, or synthetic fallback if enabled.
+
+        Raises:
+            InsufficientHistoryError: Prometheus has fewer than T/2 points for either metric
+                and ``synthetic_fallback`` is False.
+        """
         now = time.time()
         T = self.context_steps
         H = self.horizon_steps
@@ -215,17 +262,18 @@ class MetricsCollector:
         start_time = target_timestamps[0]
         end_time = now
 
-        # 1. Attempt to query Prometheus
-        kv_cache_points = self.query_prometheus_range(
-            "vllm:kv_cache_usage_perc", start_time, end_time, dt
-        )
-        if not kv_cache_points:
+        # 1. Attempt to query Prometheus. vLLM exposes one series per engine/model label set,
+        # so aggregate with max() to forecast the most loaded engine instead of an arbitrary one.
+        kv_cache_points: list[tuple[float, float]] = []
+        for metric_name in KV_CACHE_METRIC_NAMES:
             kv_cache_points = self.query_prometheus_range(
-                "vllm:gpu_cache_usage_factor", start_time, end_time, dt
+                f"max({metric_name})", start_time, end_time, dt
             )
+            if kv_cache_points:
+                break
 
         waiting_points = self.query_prometheus_range(
-            "vllm:num_requests_waiting", start_time, end_time, dt
+            f"max({REQUESTS_WAITING_METRIC_NAME})", start_time, end_time, dt
         )
 
         has_sufficient_history = len(kv_cache_points) >= (T // 2) and len(waiting_points) >= (
@@ -237,6 +285,13 @@ class MetricsCollector:
             kv_cache = self.align_series_to_grid(kv_cache_points, target_timestamps)
             requests_waiting = self.align_series_to_grid(waiting_points, target_timestamps)
             timestamps = target_timestamps
+            data_source = DATA_SOURCE_PROMETHEUS
+        elif not self.synthetic_fallback:
+            raise InsufficientHistoryError(
+                f"Prometheus returned {len(kv_cache_points)} KV-cache and {len(waiting_points)} "
+                f"queue points; at least {T // 2} of each are required "
+                "(enable synthetic fallback to forecast on generated history instead)"
+            )
         else:
             # Check if direct live point exists from Prometheus or direct vLLM
             latest_cache = 0.07  # Realistic baseline default
@@ -251,7 +306,7 @@ class MetricsCollector:
             if direct is not None:
                 latest_cache, latest_waiting = direct
 
-            logger.info(
+            logger.warning(
                 "Prometheus history sparse (%d points); applying synthetic replay with live anchor "
                 "(cache=%.3f, waiting=%.1f)",
                 len(kv_cache_points),
@@ -261,6 +316,7 @@ class MetricsCollector:
             timestamps, kv_cache, requests_waiting = self.generate_synthetic_context(
                 now, current_cache=latest_cache, current_waiting=latest_waiting
             )
+            data_source = DATA_SOURCE_SYNTHETIC
 
         # Normalize and clip
         kv_cache = np.clip(kv_cache, 0.0, 1.0).astype(np.float32)
@@ -283,4 +339,5 @@ class MetricsCollector:
             interval_seconds=dt,
             context_steps=T,
             horizon_steps=H,
+            data_source=data_source,
         )

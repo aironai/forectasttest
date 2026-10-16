@@ -13,7 +13,9 @@ def test_end_to_end_spike_pattern_and_breach_alert() -> None:
     # 1. Initialize daemon in mock mode for fast deterministic integration test
     daemon = ForecastingDaemon(
         prometheus_url="http://mock-offline-prom:9999",
+        vllm_url="http://mock-offline-vllm:9999",
         mock_mode=True,
+        synthetic_fallback=True,
         context_steps=128,
         horizon_steps=60,  # 15 minutes
         step_seconds=15,
@@ -81,7 +83,10 @@ def test_end_to_end_spike_pattern_and_breach_alert() -> None:
 def test_end_to_end_real_timestral_cpu_pass() -> None:
     """End-to-end integration test with the real loaded Timestral-5M model on CPU."""
     daemon = ForecastingDaemon(
+        prometheus_url="http://mock-offline-prom:9999",
+        vllm_url="http://mock-offline-vllm:9999",
         model_name="mistralai/Timestral-5M",
+        synthetic_fallback=True,
         cpu_threads=8,
         context_steps=128,
         horizon_steps=60,

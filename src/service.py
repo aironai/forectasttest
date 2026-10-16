@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -16,9 +17,10 @@ import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
-from src.collector import MetricsCollector
+from src.collector import InsufficientHistoryError, MetricsCollector
 from src.exporter import MetricsExporter
 from src.forecaster import ForecastResult, TimestralVLLMForecaster
+from src.notifier import AlertConfig, EarlyWarningNotifier
 from src.pusher import PushgatewayClient
 
 logging.basicConfig(
@@ -45,6 +47,11 @@ class ForecastingDaemon:
         forecast_interval_seconds: int = 60,
         pushgateway_url: str | None = None,
         mock_mode: bool = False,
+        synthetic_fallback: bool = False,
+        cache_breach_threshold: float = 0.85,
+        queue_breach_threshold: float = 8.0,
+        notifier: EarlyWarningNotifier | None = None,
+        notify_on_synthetic: bool = False,
     ) -> None:
         self.prometheus_url = prometheus_url
         self.vllm_url = vllm_url
@@ -57,6 +64,8 @@ class ForecastingDaemon:
         self.forecast_interval_seconds = forecast_interval_seconds
         self.pushgateway_url = pushgateway_url
         self.mock_mode = mock_mode
+        self.synthetic_fallback = synthetic_fallback
+        self.notify_on_synthetic = notify_on_synthetic
 
         self.collector = MetricsCollector(
             prometheus_url=self.prometheus_url,
@@ -64,6 +73,7 @@ class ForecastingDaemon:
             context_steps=self.context_steps,
             horizon_steps=self.horizon_steps,
             step_seconds=self.step_seconds,
+            synthetic_fallback=self.synthetic_fallback,
         )
 
         self.forecaster = TimestralVLLMForecaster(
@@ -72,23 +82,49 @@ class ForecastingDaemon:
             cpu_threads=self.cpu_threads,
             prediction_length=self.horizon_steps,
             step_seconds=self.step_seconds,
+            cache_breach_threshold=cache_breach_threshold,
+            queue_breach_threshold=queue_breach_threshold,
             mock_mode=self.mock_mode,
         )
 
         self.exporter = MetricsExporter()
         self.pusher = PushgatewayClient(self.pushgateway_url) if self.pushgateway_url else None
 
+        self.notifier = notifier
+        if self.notifier is not None and not self.notifier.is_configured():
+            logger.info("Alert notifier has no channel configured; notifications disabled")
+            self.notifier = None
+
         self.latest_result: ForecastResult | None = None
+        self.last_alert_status: dict[str, Any] | None = None
+        self.last_cycle_error: str | None = None
         self.is_running = False
         self._task: asyncio.Task[None] | None = None
+        # Serializes the background loop and /api/trigger so they never interleave on the
+        # model, the exporter registry, or the notifier's breach state
+        self._cycle_lock = threading.Lock()
 
     def run_single_cycle(self) -> ForecastResult:
-        """Runs one full forecasting cycle synchronously with detailed profiling."""
+        """Runs one full forecasting cycle synchronously with detailed profiling.
+
+        Raises:
+            InsufficientHistoryError: not enough real history and synthetic fallback is off.
+                The cycle is counted in ``timestral_forecast_cycles_skipped_total``.
+        """
+        with self._cycle_lock:
+            return self._run_cycle_locked()
+
+    def _run_cycle_locked(self) -> ForecastResult:
         cycle_start = time.perf_counter()
 
         # Step 1: Collect historical window & temporal covariates
         t_col_start = time.perf_counter()
-        window = self.collector.collect()
+        try:
+            window = self.collector.collect()
+        except InsufficientHistoryError as e:
+            self.exporter.record_skipped_cycle("insufficient_history")
+            self.last_cycle_error = str(e)
+            raise
         col_duration_ms = (time.perf_counter() - t_col_start) * 1000.0
 
         # Step 2: CPU-bound Timestral forward pass
@@ -98,6 +134,7 @@ class ForecastingDaemon:
             known_covariates=window.covariates,
             last_timestamp=last_ts,
         )
+        result.synthetic_input = window.is_synthetic
 
         # Step 3: Export metrics to Prometheus registry
         t_exp_start = time.perf_counter()
@@ -106,10 +143,15 @@ class ForecastingDaemon:
             self.pusher.push(self.exporter.registry)
         exp_duration_ms = (time.perf_counter() - t_exp_start) * 1000.0
 
-        total_duration_ms = (time.perf_counter() - cycle_start) * 1000.0
         self.latest_result = result
+        self.last_cycle_error = None
 
-        # Step 4: Structured logging
+        # Step 4: Early warning notifications (Slack / email)
+        self._dispatch_notifications(result)
+
+        total_duration_ms = (time.perf_counter() - cycle_start) * 1000.0
+
+        # Step 5: Structured logging
         s15 = next((s for s in result.summaries if s.lead_time_label == "15m"), None)
         s30 = next((s for s in result.summaries if s.lead_time_label == "30m"), None)
 
@@ -137,7 +179,8 @@ class ForecastingDaemon:
         logger.info(
             "Forecast complete: model=%s | latency=%.2fms (threads=%d) | "
             "collect=%.1fms, export=%.1fms, total=%.1fms | "
-            "KV+15m: [%s] | KV+30m: [%s] | Queue+15m: [%s] | Status: %s | RSS: %.1fMB | VRAM: 0MB",
+            "KV+15m: [%s] | KV+30m: [%s] | Queue+15m: [%s] | Status: %s | input=%s | "
+            "RSS: %.1fMB | VRAM: 0MB",
             result.model_name,
             result.inference_latency_ms,
             result.cpu_threads,
@@ -148,10 +191,32 @@ class ForecastingDaemon:
             cache_30_str,
             queue_15_str,
             breach_status,
+            "synthetic" if result.synthetic_input else "prometheus",
             self.exporter.get_process_rss_bytes() / (1024 * 1024),
         )
 
         return result
+
+    def _dispatch_notifications(self, result: ForecastResult) -> None:
+        """Sends Slack/email alerts for breach state changes. Never raises."""
+        if self.notifier is None:
+            return
+        if result.is_synthetic and not self.notify_on_synthetic:
+            logger.info(
+                "Skipping notifications: forecast is based on synthetic %s",
+                "history" if result.synthetic_input else "model output",
+            )
+            return
+        try:
+            status = self.notifier.notify_forecast(result)
+        except Exception as e:
+            logger.error("Notifier failed: %s", e, exc_info=True)
+            return
+        self.last_alert_status = status
+        for channel in ("slack", "email"):
+            sent = status.get(f"{channel}_sent")
+            if sent is not None:
+                self.exporter.record_notification(status["alert_type"], channel, bool(sent))
 
     async def start_loop(self) -> None:
         """Starts the recurring forecasting loop."""
@@ -163,20 +228,20 @@ class ForecastingDaemon:
             self.horizon_steps,
         )
 
-        # Run first cycle immediately
-        try:
-            self.run_single_cycle()
-        except Exception as e:
-            logger.error("Initial forecast cycle error: %s", e, exc_info=True)
-
+        first = True
         while self.is_running:
             try:
-                await asyncio.sleep(self.forecast_interval_seconds)
+                # Run the first cycle immediately, then once per interval
+                if not first:
+                    await asyncio.sleep(self.forecast_interval_seconds)
+                first = False
                 if not self.is_running:
                     break
                 await asyncio.to_thread(self.run_single_cycle)
             except asyncio.CancelledError:
                 break
+            except InsufficientHistoryError as e:
+                logger.warning("Forecast cycle skipped: %s", e)
             except Exception as e:
                 logger.error("Error in forecasting daemon loop: %s", e, exc_info=True)
 
@@ -224,6 +289,7 @@ def create_app(daemon: ForecastingDaemon) -> FastAPI:
     @app.get("/health")
     def health_endpoint() -> dict[str, Any]:
         """Liveness and status check."""
+        latest = daemon.latest_result
         return {
             "status": "healthy",
             "model": daemon.forecaster.active_model_name,
@@ -235,9 +301,18 @@ def create_app(daemon: ForecastingDaemon) -> FastAPI:
                 if daemon.latest_result
                 else None
             ),
-            "breach_warning": (
-                daemon.latest_result.breach_warning if daemon.latest_result else False
-            ),
+            "breach_warning": latest.breach_warning if latest else False,
+            "synthetic_input": latest.synthetic_input if latest else None,
+            "synthetic_model": latest.synthetic_model if latest else None,
+            "synthetic_fallback_enabled": daemon.synthetic_fallback,
+            "last_cycle_error": daemon.last_cycle_error,
+            "alerting": {
+                "enabled": daemon.notifier is not None,
+                "slack": bool(daemon.notifier and daemon.notifier.config.slack_enabled),
+                "email": bool(daemon.notifier and daemon.notifier.config.email_enabled),
+                "in_breach_state": bool(daemon.notifier and daemon.notifier.in_breach_state),
+                "last_status": daemon.last_alert_status,
+            },
         }
 
     @app.get("/api/forecast")
@@ -247,13 +322,20 @@ def create_app(daemon: ForecastingDaemon) -> FastAPI:
             return JSONResponse(status_code=503, content={"error": "No forecast generated yet"})
         return JSONResponse(content=daemon.latest_result.to_dict())
 
-    @app.post("/api/trigger")
-    def trigger_forecast() -> dict[str, Any]:
+    @app.post("/api/trigger", response_model=None)
+    def trigger_forecast() -> dict[str, Any] | JSONResponse:
         """Manually triggers an immediate forecasting cycle."""
-        result = daemon.run_single_cycle()
+        try:
+            result = daemon.run_single_cycle()
+        except InsufficientHistoryError as e:
+            return JSONResponse(status_code=503, content={"status": "skipped", "error": str(e)})
         return {"status": "success", "result": result.to_dict()}
 
     return app
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "false").lower() in ("true", "1", "yes")
 
 
 def parse_args() -> argparse.Namespace:
@@ -322,6 +404,31 @@ def parse_args() -> argparse.Namespace:
         help="Prometheus Pushgateway URL (optional)",
     )
     parser.add_argument(
+        "--synthetic-fallback",
+        action="store_true",
+        default=_env_flag("SYNTHETIC_FALLBACK"),
+        help="Forecast on generated history when Prometheus has too little data "
+        "(demo/offline only; default: off, cycles are skipped instead)",
+    )
+    parser.add_argument(
+        "--cache-threshold",
+        type=float,
+        default=float(os.getenv("CACHE_BREACH_THRESHOLD", "0.85")),
+        help="KV-cache p90 breach threshold as a fraction (default: 0.85)",
+    )
+    parser.add_argument(
+        "--queue-threshold",
+        type=float,
+        default=float(os.getenv("QUEUE_BREACH_THRESHOLD", "8")),
+        help="Waiting-queue p90 breach threshold in requests (default: 8)",
+    )
+    parser.add_argument(
+        "--notify-on-synthetic",
+        action="store_true",
+        default=_env_flag("NOTIFY_ON_SYNTHETIC"),
+        help="Also send Slack/email alerts for forecasts built on synthetic data (default: off)",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Enable mock mode for unit testing or offline environments",
@@ -338,12 +445,28 @@ def main() -> None:
     logger.info("   Target Model: %s (Fallback: %s)", args.model_name, args.fallback_model)
     logger.info("   CPU Threads: %d | Device: CPU | GPU VRAM Impact: 0 MB", args.threads)
     logger.info(
-        "   Context: %d steps | Horizon: %d steps (30 min)",
+        "   Context: %d steps | Horizon: %d steps (%d min at 15s steps)",
         args.context_steps,
         args.horizon_steps,
+        args.horizon_steps * 15 // 60,
     )
     logger.info("   Prometheus Source: %s | Exporter Port: %d", args.prometheus_url, args.port)
+    logger.info(
+        "   Synthetic fallback: %s | Thresholds: KV p90 >= %.0f%%, queue p90 >= %.0f",
+        "ON (demo mode)" if args.synthetic_fallback else "off",
+        args.cache_threshold * 100,
+        args.queue_threshold,
+    )
     logger.info("=" * 70)
+
+    notifier = EarlyWarningNotifier(AlertConfig.from_env())
+    if notifier.is_configured():
+        logger.info(
+            "Early warning alerts enabled (slack=%s, email=%s, cooldown=%ds)",
+            notifier.config.slack_enabled,
+            notifier.config.email_enabled,
+            notifier.config.cooldown_seconds,
+        )
 
     daemon = ForecastingDaemon(
         prometheus_url=args.prometheus_url,
@@ -356,6 +479,11 @@ def main() -> None:
         forecast_interval_seconds=args.interval,
         pushgateway_url=args.pushgateway_url,
         mock_mode=args.mock,
+        synthetic_fallback=args.synthetic_fallback,
+        cache_breach_threshold=args.cache_threshold,
+        queue_breach_threshold=args.queue_threshold,
+        notifier=notifier,
+        notify_on_synthetic=args.notify_on_synthetic,
     )
 
     app = create_app(daemon)

@@ -8,6 +8,7 @@ import time
 
 from prometheus_client import (
     CollectorRegistry,
+    Counter,
     Gauge,
     Histogram,
     generate_latest,
@@ -108,6 +109,34 @@ class MetricsExporter:
             registry=self.registry,
         )
 
+        self.synthetic_input_gauge = Gauge(
+            "timestral_forecast_synthetic_input",
+            "1 if the latest forecast was computed on generated (synthetic) history, 0 if on "
+            "real Prometheus history",
+            registry=self.registry,
+        )
+
+        self.synthetic_model_gauge = Gauge(
+            "timestral_forecast_synthetic_model",
+            "1 if the latest forecast came from the mock/fallback generator instead of a "
+            "Timestral checkpoint, 0 otherwise",
+            registry=self.registry,
+        )
+
+        self.cycles_skipped = Counter(
+            "timestral_forecast_cycles_skipped",
+            "Forecast cycles skipped without producing a forecast",
+            ["reason"],
+            registry=self.registry,
+        )
+
+        self.notifications = Counter(
+            "timestral_alert_notifications",
+            "Early warning notification attempts per channel and outcome",
+            ["alert_type", "channel", "outcome"],
+            registry=self.registry,
+        )
+
         # Current process RSS reader
         self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
@@ -186,7 +215,19 @@ class MetricsExporter:
         lead_time_val = float(result.breach_lead_time_seconds or 0)
         self.breach_lead_time_gauge.set(lead_time_val)
 
+        self.synthetic_input_gauge.set(1.0 if result.synthetic_input else 0.0)
+        self.synthetic_model_gauge.set(1.0 if result.synthetic_model else 0.0)
+
         self.last_forecast_timestamp.set(time.time())
+
+    def record_skipped_cycle(self, reason: str) -> None:
+        """Counts a forecast cycle that produced no forecast (reason is a fixed slug)."""
+        self.cycles_skipped.labels(reason=reason).inc()
+
+    def record_notification(self, alert_type: str, channel: str, sent: bool) -> None:
+        """Counts one notification attempt on a channel ("slack" or "email")."""
+        outcome = "sent" if sent else "failed"
+        self.notifications.labels(alert_type=alert_type, channel=channel, outcome=outcome).inc()
 
     def export_text(self) -> str:
         """Returns Prometheus text-formatted metrics."""

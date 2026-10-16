@@ -6,8 +6,15 @@ import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
-from src.collector import MetricsCollector, ObservationWindow
+from src.collector import (
+    DATA_SOURCE_PROMETHEUS,
+    DATA_SOURCE_SYNTHETIC,
+    InsufficientHistoryError,
+    MetricsCollector,
+    ObservationWindow,
+)
 
 
 def test_temporal_covariates_generation() -> None:
@@ -135,3 +142,83 @@ def test_collector_prometheus_query_mocked() -> None:
         pts = collector.query_prometheus_range("vllm:kv_cache_usage_perc", 1000.0, 1150.0, 15)
         assert len(pts) == 10
         assert pts[0] == (1000.0, 0.15)
+
+
+def _prom_response(n_points: int, value: str = "0.15") -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "status": "success",
+        "data": {
+            "result": [
+                {"metric": {}, "values": [[1000.0 + i * 15, value] for i in range(n_points)]}
+            ]
+        },
+    }
+    return resp
+
+
+def test_collect_raises_without_history_when_fallback_disabled() -> None:
+    collector = MetricsCollector(
+        prometheus_url="http://invalid-prom-url:9999",
+        vllm_url="http://invalid-vllm-url:9999",
+        context_steps=64,
+        horizon_steps=16,
+    )
+    assert collector.synthetic_fallback is False
+
+    with pytest.raises(InsufficientHistoryError, match="at least 32"):
+        collector.collect()
+
+
+def test_collect_marks_synthetic_window() -> None:
+    collector = MetricsCollector(
+        prometheus_url="http://invalid-prom-url:9999",
+        vllm_url="http://invalid-vllm-url:9999",
+        context_steps=64,
+        horizon_steps=16,
+        synthetic_fallback=True,
+    )
+    window = collector.collect()
+    assert window.data_source == DATA_SOURCE_SYNTHETIC
+    assert window.is_synthetic is True
+
+
+def test_collect_uses_max_aggregation_and_marks_real_history() -> None:
+    collector = MetricsCollector(prometheus_url="http://mock-prom:9090", context_steps=10)
+
+    with patch("requests.get", return_value=_prom_response(10)) as mock_get:
+        window = collector.collect()
+
+    queries = [c.kwargs["params"]["query"] for c in mock_get.call_args_list]
+    assert queries == ["max(vllm:kv_cache_usage_perc)", "max(vllm:num_requests_waiting)"]
+    assert window.data_source == DATA_SOURCE_PROMETHEUS
+    assert window.is_synthetic is False
+
+
+def test_direct_scrape_matches_exact_names_and_takes_max() -> None:
+    collector = MetricsCollector(vllm_url="http://mock-vllm:8000")
+    body = "\n".join(
+        [
+            "# HELP vllm:kv_cache_usage_perc KV-cache usage.",
+            "# TYPE vllm:kv_cache_usage_perc gauge",
+            'vllm:kv_cache_usage_perc{engine="0",model_name="kimi-k3"} 0.42',
+            'vllm:kv_cache_usage_perc{engine="1",model_name="kimi-k3"} 0.61',
+            # Similar names that must not be matched
+            'vllm:kv_cache_usage_perc_created{engine="0"} 1792165000.0',
+            'vllm:num_requests_waiting_by_reason{reason="capacity"} 99.0',
+            'vllm:num_requests_waiting{engine="0"} 3.0',
+            'vllm:num_requests_waiting{engine="1"} 5.0 1792165000000',
+        ]
+    )
+    resp = MagicMock(status_code=200, text=body)
+
+    with patch("requests.get", return_value=resp):
+        assert collector.sample_direct_vllm_metrics() == (0.61, 5.0)
+
+
+def test_direct_scrape_without_kv_metric_returns_none() -> None:
+    collector = MetricsCollector(vllm_url="http://mock-vllm:8000")
+    resp = MagicMock(status_code=200, text="vllm:num_requests_waiting 3.0\n")
+    with patch("requests.get", return_value=resp):
+        assert collector.sample_direct_vllm_metrics() is None
