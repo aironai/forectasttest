@@ -97,7 +97,7 @@ Measured on the 8x B300 HGX host machine running with `torch.set_num_threads(8)`
 Clone the repository and install all dependencies in seconds using `uv`:
 
 ```bash
-git clone https://github.com/joenaess/forectasttest.git
+git clone https://github.com/aironai/forectasttest.git
 cd forectasttest
 
 # Sync dependencies and Timestral from GitHub
